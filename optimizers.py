@@ -134,7 +134,14 @@ def trust_region_optimization(x0, mu, A_values, max_iterations=100, initial_radi
         distances = np.linalg.norm(np.array(X_cumulative) - x, axis=1)
         alpha = 0.25  # Decay rate parameter, adjust based on problem
         weights = np.where(distances >= 10*radius, 0, np.exp(-alpha * (distances)**2))
-        print("Ağırlıklar:", weights)
+        # Create a dictionary pairing distances with weights
+        distance_weight_dict = {f"Data point {i+1}": {"Distance": distances[i], "Weight": weights[i]} 
+                            for i in range(len(distances))}
+
+        # Log distances and weights
+        print(f"Iteration {iteration}:")
+        for key, value in distance_weight_dict.items(): 
+          print(f"{key}: Distance = {value['Distance']:.6f}, Weight = {value['Weight']:.6f}")
 
         # Transform the data using PolynomialFeatures
         poly = PolynomialFeatures(degree=2, include_bias=True)
