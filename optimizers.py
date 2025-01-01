@@ -65,7 +65,7 @@ def constraint(x, mu, A_values):
 
     return -(term1 + term2 - term3 + 2/15 - 0.0001)
 
-def generate_data(x, radius, mu, A_values, n_samples=30):
+def generate_data(x, radius, mu, A_values, n_samples):
     """Generate data points around current point x within given radius."""
     X = []
     y_obj = []
@@ -78,56 +78,132 @@ def generate_data(x, radius, mu, A_values, n_samples=30):
         y_const.append(constraint(x_new, mu, A_values))
     return np.array(X), np.array(y_obj), np.array(y_const)
 
-def trust_region_optimization(x0, mu, A_values, max_iterations=100, initial_radius=1.0):
-    """Main trust region optimization function."""
+def check_feasibility(x, mu, A_values):
+    """Check if the point x satisfies the constraints."""
+    constraint_value = constraint(x, mu, A_values)
+    return constraint_value <= 0  # Check if the constraint is satisfied (g(x) <= 0)
+
+def project_onto_feasible_region(x, mu, A_values, radius=0.1):
+    """Project the point x onto the feasible region if it violates the constraints."""
+    violation = constraint(x, mu, A_values)
+    if violation > 0:  # If there's a violation
+        # Move the point in the direction that improves feasibility
+        correction = radius * violation  # Adjust correction factor as needed
+        x_new = x - correction  # Adjust the position to decrease the violation
+        return x_new
+    return x  # If feasible, return as is
+
+def trust_region_optimization(x0, mu, A_values, max_iterations=100, initial_radius=1.0, initial_sample = 30, new_generation= 1):
+    """Main trust region optimization function with weight decay calibration."""
+    # Check if initial point is feasible and project if necessary
+    if not check_feasibility(x0, mu, A_values):
+        print("Initial point is infeasible. Projecting onto the feasible region.")
+        x0 = project_onto_feasible_region(x0, mu, A_values)
+
     x = x0
     radius = initial_radius
     results = []
-    objective_values = []
-    predicted_objective_values = []
+    penalty_factor = 1000  # Penalty for constraint violations
+    X_cumulative = []
+    y_obj_cumulative = []
+    y_const_cumulative = []
+
+    # Lists to store values for output
     constraint_values = []
     predicted_constraint_values = []
+    objective_values = []
+    predicted_objective_values = []
 
+    # Generate initial dataset
+    X_init, y_obj_init, y_const_init = generate_data(x, radius, mu, A_values, n_samples = initial_sample)
+    X_cumulative.extend(X_init)
+    y_obj_cumulative.extend(y_obj_init)
+    y_const_cumulative.extend(y_const_init)
+    count = 0
     for iteration in range(max_iterations):
-        # Generate data points and fit models
-        X, y_obj, y_const = generate_data(x, radius, mu, A_values)
+        # Generate one new data point
+        for _ in range(new_generation):
+          delta = np.random.uniform(-radius, radius, n)
+          x_new = x + delta
 
-        # Create and fit separate models for objective and constraint
-        objective_model = make_pipeline(
-            PolynomialFeatures(degree=2, include_bias=True),
-            LinearRegression()
-        )
-        constraint_model = make_pipeline(
-            PolynomialFeatures(degree=2, include_bias=True),
-            LinearRegression()
-        )
+          X_cumulative.append(x_new)
+          y_obj_cumulative.append(objective(x_new))
+          y_const_cumulative.append(constraint(x_new, mu, A_values))
 
-        objective_model.fit(X, y_obj)
-        constraint_model.fit(X, y_const)
+        # Calculate adaptive weights with calibrated decay
+        distances = np.linalg.norm(np.array(X_cumulative) - x, axis=1)
+        alpha = 0.25  # Decay rate parameter, adjust based on problem
+        weights = np.where(distances >= 10*radius, 0, np.exp(-alpha * (distances)**2))
+        print("Ağırlıklar:", weights)
 
+        # Transform the data using PolynomialFeatures
+        poly = PolynomialFeatures(degree=2, include_bias=True)
+        X_transformed = poly.fit_transform(np.array(X_cumulative))
+
+        # Fit objective and constraint models
+        objective_model = LinearRegression()
+        constraint_model = LinearRegression()
+
+        objective_model.fit(X_transformed, np.array(y_obj_cumulative), sample_weight=weights)
+        constraint_model.fit(X_transformed, np.array(y_const_cumulative), sample_weight=weights)
+
+        # Define surrogate subproblem
         def subproblem_objective(delta):
-            """Surrogate objective function for the subproblem."""
-            delta_reshaped = np.array([x + delta])
-            return objective_model.predict(delta_reshaped)[0]
+            delta_transformed = poly.transform([x + delta])
+            return objective_model.predict(delta_transformed)[0]
 
         def subproblem_constraint(delta):
-            """Surrogate constraint function for the subproblem."""
-            delta_reshaped = np.array([x + delta])
-            return constraint_model.predict(delta_reshaped)[0]
+            delta_transformed = poly.transform([x + delta])
+            return constraint_model.predict(delta_transformed)[0]
 
-        # Solve the trust region subproblem
-        res = minimize(subproblem_objective, np.zeros(n), method='SLSQP',
+        # Solve subproblem
+        res = minimize(subproblem_objective, np.zeros_like(x), method='SLSQP',
                       constraints={'type': 'ineq', 'fun': subproblem_constraint},
-                      bounds=[(-radius, radius)] * n,
-                      options={'ftol': 1e-8, 'maxiter': 200})
+                      bounds=[(-radius, radius)] * len(x))
 
         delta = res.x
-        print("Status:", res.status)
-        # Calculate actual and predicted values
+
+        # Calculate actual-to-predicted ratio (p_k)
         real_constraint_value = constraint(x + delta, mu, A_values)
         predicted_constraint_value = subproblem_constraint(delta)
         real_objective_value = objective(x + delta)
         predicted_objective_value = subproblem_objective(delta)
+
+        px = objective(x) + penalty_factor * max(0, -1 * constraint(x, mu, A_values))
+        pxx = objective(x + delta) + penalty_factor * max(0, -1 * constraint(x + delta, mu, A_values))
+
+        mp = subproblem_objective(0) + penalty_factor * max(0, -1 * subproblem_constraint(0))
+        mpp = subproblem_objective(delta) + penalty_factor * max(0, -1 * subproblem_constraint(delta))
+
+        pk = (px - pxx) / (mp - mpp) if (mp - mpp) != 0 else 0
+        print("px=",px)
+        print("mp=",mp)
+        print("pxx=",pxx)
+        print("mpp=",mpp)
+        # Adjust trust region radius
+        if pk <= 0.1:
+            count += 1
+        if count >= 10:
+            radius = initial_radius
+            count = 0
+        if pk >= 0.6:
+            radius = min(2 * radius, 2.0)
+        elif pk < 0.1:
+            radius = max(0.5 * radius, 0.001)
+
+        # Update solution if improvement is sufficient
+        if pk >= 0.1:
+            x = x + delta
+
+        # Log progress
+        if iteration % 1 == 0:
+            print(f"Iteration {iteration}:")
+            print(f"Radius: {radius:.6f}")
+            print(f"pk: {pk:.6f}")
+            print(f"Objective: {objective(x):.6f}")
+            print(f"Constraint: {constraint(x, mu, A_values):.6f}")
+            print(f"Historical data points: {len(X_cumulative)}")
+            print("------------------------")
 
         # Store values for logging
         constraint_values.append(real_constraint_value)
@@ -135,40 +211,14 @@ def trust_region_optimization(x0, mu, A_values, max_iterations=100, initial_radi
         objective_values.append(real_objective_value)
         predicted_objective_values.append(predicted_objective_value)
 
-        # Handle very small changes
-        px = objective(x) + 1000 * max(0, -1*constraint(x, mu, A_values))
-        pxx = objective(x + delta) + 1000 * max(0, -1*constraint(x + delta, mu, A_values))
-
-        mp = subproblem_objective(0) + 1000 * max(0, -1*subproblem_constraint(0))
-        mpp = subproblem_objective(delta) + 1000 * max(0, -1*subproblem_constraint(delta))
-
-
-        pk = (px - pxx) / (mp - mpp) if (mp - mpp) != 0 else 0
-
-        # Update trust region radius
-        if pk > 0.9:
-            radius = min(2*radius, 2)
-        elif pk < 0.1:
-            radius = max(0.5*radius, 0.001)
-
-        # Update solution if improvement is sufficient
-        if pk > 0.1:
-            x = x + delta
-
-        # Log progress
-        if iteration % 5 == 0:
-            print(f"Iteration {iteration}:")
-            print(f"Radius: {radius:.6f}")
-            print(f"pk: {pk:.6f}")
-            print(f"Objective: {real_objective_value:.6f}")
-            print(f"Constraint: {real_constraint_value:.6f}")
-            print("------------------------")
-
         # Store results
         results.append((iteration, objective(x), x, real_constraint_value, predicted_constraint_value,
                        real_objective_value, predicted_objective_value))
 
     return results, constraint_values, predicted_constraint_values, objective_values, predicted_objective_values
+
+
+
 
 def save_results(results, filename='optimization_results_polynomial.csv'):
     """Save optimization results to CSV file."""
